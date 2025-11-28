@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<head>
+    <title>Obaminator</title>
+</head>
+<body>
+    <h1>Pick:</h1>
+    <div>
+        <button id="Draw">Draw</button>
+        <button id="Insert">Insert</button>
+        <input id="fileInput" type="file" accept="image/*" style="display:none">
+        <input id="targetInput" type="file" accept="image/*" style="display:none">
+        <!-- Optional: put a local target image named "obama.jpg" next to this HTML,
+             or click the "target" button (shown below) to choose a target portrait. -->
+        <button id="ChooseTarget">Choose target</button>
+        <br><br>
+        <canvas id="work" width="400" height="500" style="border:1px solid #999"></canvas>
+        <canvas id="offscreen" width="400" height="500" style="display:none"></canvas>
+        <img id="targetImg" src="obama.jpg" style="display:none" crossorigin="anonymous">
+
+        <!-- NEW: drawing tools -->
+        <div id="tools" style="margin-top:10px;">
+          <label>Tool:
+            <button id="toolBrush" data-tool="brush">Brush</button>
+            <button id="toolEraser" data-tool="eraser">Eraser</button>
+            <button id="toolFill" data-tool="fill">Fill</button>
+          </label>
+          &nbsp;&nbsp;
+          <label>Size:
+            <input id="sizeRange" type="range" min="1" max="40" value="6">
+            <span id="sizeDisplay">6</span>px
+          </label>
+          &nbsp;&nbsp;
+          <label>Color:
+            <input id="colorPicker" type="color" value="#000000">
+          </label>
+        </div>
+    </div>
+
+    <script>
+    (function(){
+      const work = document.getElementById('work');
+      const ctx = work.getContext('2d');
+      const off = document.getElementById('offscreen');
+      const offCtx = off.getContext('2d');
+      const DrawBtn = document.getElementById('Draw');
+      const InsertBtn = document.getElementById('Insert');
+      const fileInput = document.getElementById('fileInput');
+      const targetInput = document.getElementById('targetInput');
+      const ChooseTarget = document.getElementById('ChooseTarget');
+      const targetImg = document.getElementById('targetImg');
+
+      // new UI
+      const toolBrush = document.getElementById('toolBrush');
+      const toolEraser = document.getElementById('toolEraser');
+      const toolFill = document.getElementById('toolFill');
+      const sizeRange = document.getElementById('sizeRange');
+      const sizeDisplay = document.getElementById('sizeDisplay');
+      const colorPicker = document.getElementById('colorPicker');
+
+      const W = work.width, H = work.height;
+      let drawing = false;
+      let isDrawMode = false;
+      let drawOrder = []; // store drawn pixel sources {x,y,color,order}
+      let particles = []; // animated particles
+      let animationId = null;
+
+      // drawing tool state
+      let currentTool = 'brush'; // 'brush'|'eraser'|'fill'
+      let brushSize = parseInt(sizeRange.value,10);
+      let brushColor = hexToRgba(colorPicker.value);
+
+      sizeRange.addEventListener('input', ()=> {
+        brushSize = parseInt(sizeRange.value,10);
+        sizeDisplay.textContent = brushSize;
+      });
+      colorPicker.addEventListener('input', ()=> {
+        brushColor = hexToRgba(colorPicker.value);
+      });
+
+      function setActiveTool(t){
+        currentTool = t;
+        [toolBrush,toolEraser,toolFill].forEach(b=> b.style.outline = '');
+        if(t === 'brush') toolBrush.style.outline = '2px solid #66f';
+        if(t === 'eraser') toolEraser.style.outline = '2px solid #66f';
+        if(t === 'fill') toolFill.style.outline = '2px solid #66f';
+      }
+      toolBrush.addEventListener('click', ()=> setActiveTool('brush'));
+      toolEraser.addEventListener('click', ()=> setActiveTool('eraser'));
+      toolFill.addEventListener('click', ()=> setActiveTool('fill'));
+      setActiveTool('brush');
+
+      // simple drawing (uses tool state)
+      work.addEventListener('pointerdown', e=>{
+        if(!isDrawMode) return;
+        const p = getPos(e);
+
+        if(currentTool === 'fill'){
+          // perform flood fill at point with brushColor
+          const changed = floodFill(Math.floor(p.x), Math.floor(p.y), brushColor);
+          // add some samples of changed pixels into drawOrder
+          for(let i=0;i<changed.length;i+=2){
+            const c = changed[i];
+            addDrawPixel(Math.floor(c.x), Math.floor(c.y));
+          }
+          return;
+        }
+
+        drawing = true;
+        ctx.lineWidth = brushSize;
+        ctx.lineCap = 'round';
+        if(currentTool === 'eraser'){
+          ctx.globalCompositeOperation = 'destination-out';
+          ctx.strokeStyle = 'rgba(0,0,0,1)';
+        } else {
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.strokeStyle = `rgba(${brushColor[0]},${brushColor[1]},${brushColor[2]},${brushColor[3]/255})`;
+        }
+        ctx.beginPath();
+        ctx.moveTo(p.x,p.y);
+        addDrawPixel(p.x,p.y);
+      });
+
+      work.addEventListener('pointermove', e=>{
+        if(!drawing) return;
+        const p = getPos(e);
+        ctx.lineTo(p.x,p.y);
+        ctx.stroke();
+        addDrawPixel(p.x,p.y);
+      });
+
+      window.addEventListener('pointerup', ()=> {
+        if(drawing) drawing = false;
+      });
+
+      function getPos(e){
+        const r = work.getBoundingClientRect();
+        return { x: Math.floor((e.clientX - r.left) * (work.width / r.width)),
+                 y: Math.floor((e.clientY - r.top) * (work.height / r.height)) };
+      }
+
+      function addDrawPixel(x,y){
+        // clamp
+        x = Math.max(0, Math.min(W-1, Math.floor(x)));
+        y = Math.max(0, Math.min(H-1, Math.floor(y)));
+        // sample a small area depending on brush size and push representative pixels
+        const half = Math.max(1, Math.floor(brushSize/2));
+        for(let yy = y-half; yy<=y+half; yy+=Math.max(1,Math.floor(half/2))){
+          for(let xx = x-half; xx<=x+half; xx+=Math.max(1,Math.floor(half/2))){
+            if(xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+            const d = ctx.getImageData(xx,yy,1,1).data;
+            drawOrder.push({x:xx,y:yy, color: [d[0],d[1],d[2],d[3]], order: drawOrder.length});
+          }
+        }
+      }
+
+      DrawBtn.addEventListener('click', ()=>{
+        if(isDrawMode){
+          // toggle off draw mode: process drawing into particles and morph to target
+          isDrawMode = false;
+          DrawBtn.textContent = 'Draw';
+          startMorphFromDrawing();
+        } else {
+          isDrawMode = true;
+          DrawBtn.textContent = 'Finish draw';
+          // clear previous particles and stop animations
+          stopAnimation();
+          drawOrder = [];
+          ctx.clearRect(0,0,W,H);
+        }
+      });
+
+      ChooseTarget.addEventListener('click', ()=>{ targetInput.click(); });
+
+      targetInput.addEventListener('change', ev=>{
+        const f = ev.target.files[0];
+        if(!f) return;
+        const url = URL.createObjectURL(f);
+        targetImg.onload = ()=> URL.revokeObjectURL(url);
+        targetImg.src = url;
+      });
+
+      InsertBtn.addEventListener('click', ()=> fileInput.click());
+      fileInput.addEventListener('change', ev=>{
+        const f = ev.target.files[0];
+        if(!f) return;
+        const reader = new FileReader();
+        reader.onload = e=>{
+          const img = new Image();
+          img.onload = ()=> startMorphFromImage(img);
+          img.src = e.target.result;
+        };
+        reader.readAsDataURL(f);
+      });
+
+      // ---- image / target sampling helpers ----
+      function sampleTargetPixels(){
+        // draw target image onto offscreen, fit to canvas
+        if(!targetImg.complete || !targetImg.naturalWidth) {
+          // no target loaded; fallback: use current canvas content as target
+          return sampleFromContext(ctx);
+        }
+        offCtx.clearRect(0,0,W,H);
+        // fit with cover-like behavior preserving aspect
+        const sw = targetImg.naturalWidth, sh = targetImg.naturalHeight;
+        const scale = Math.max(W/sw, H/sh);
+        const dw = sw*scale, dh = sh*scale;
+        const dx = (W-dw)/2, dy = (H-dh)/2;
+        offCtx.drawImage(targetImg, 0,0,sw,sh, dx,dy,dw,dh);
+        return sampleFromContext(offCtx);
+      }
+
+      function sampleFromContext(context){
+        const imgd = context.getImageData(0,0,W,H);
+        const data = imgd.data;
+        const targets = [];
+        // compute a simple importance for each pixel: gradient + darkness
+        for(let y=1;y<H-1;y+=2){ // sample every 2 pixels for performance
+          for(let x=1;x<W-1;x+=2){
+            const i = (y*W + x)*4;
+            const r = data[i], g = data[i+1], b = data[i+2];
+            const lum = 0.299*r + 0.587*g + 0.114*b;
+            // simple gradient magnitude (sobel-like approximation)
+            const left = (data[(y*W + (x-1))*4] + data[(y*W + (x-1))*4+1] + data[(y*W + (x-1))*4+2]) /3;
+            const right = (data[(y*W + (x+1))*4] + data[(y*W + (x+1))*4+1] + data[(y*W + (x+1))*4+2]) /3;
+            const up = (data[((y-1)*W + x)*4] + data[((y-1)*W + x)*4+1] + data[((y-1)*W + x)*4+2]) /3;
+            const down = (data[((y+1)*W + x)*4] + data[((y+1)*W + x)*4+1] + data[((y+1)*W + x)*4+2]) /3;
+            const gx = Math.abs(right - left);
+            const gy = Math.abs(down - up);
+            const grad = gx + gy;
+            // importance: darker + high gradient -> higher priority
+            const importance = (255 - lum) * 0.6 + grad * 0.4;
+            if(importance > 10) {
+              targets.push({x,y,importance, color: [r,g,b, data[i+3]]});
+            }
+          }
+        }
+        // sort descending importance (pixels to draw earlier)
+        targets.sort((a,b)=> b.importance - a.importance);
+        return targets;
+      }
+
+      // ---- morphing routines ----
+      function startMorphFromDrawing(){
+        if(drawOrder.length === 0) return;
+        const sources = consolidateDrawPixels();
+        const targets = sampleTargetPixels();
+        createParticlesFromSourcesToTargets(sources, targets);
+        startAnimation();
+      }
+
+      function startMorphFromImage(img){
+        // draw the inserted image to offscreen, sample its pixels
+        offCtx.clearRect(0,0,W,H);
+        const sw = img.naturalWidth, sh = img.naturalHeight;
+        const scale = Math.min(W/sw, H/sh);
+        const dw = sw*scale, dh = sh*scale;
+        const dx = (W-dw)/2, dy = (H-dh)/2;
+        offCtx.drawImage(img, 0,0,sw,sh, dx,dy,dw,dh);
+        const srcPixels = sampleFromContext(offCtx);
+        const targets = sampleTargetPixels();
+        // srcPixels already has color & positions
+        createParticlesFromSourcesToTargets(srcPixels, targets);
+        startAnimation();
+      }
+
+      function consolidateDrawPixels(){
+        // create sources from drawOrder by sampling small blocks to avoid duplicates
+        const map = new Map();
+        for(const p of drawOrder){
+          const key = `${p.x}|${p.y}`;
+          map.set(key, p);
+        }
+        const arr = [];
+        for(const v of map.values()){
+          arr.push({x: v.x, y: v.y, color: v.color});
+        }
+        return arr;
+      }
+
+      function createParticlesFromSourcesToTargets(sources, targets){
+        stopAnimation();
+        particles = [];
+        const N = Math.min(targets.length, sources.length || targets.length);
+        // if not enough sources, create sources scattered across canvas
+        const usedSources = sources.length ? sources : generateFallbackSources(N);
+        // sort sources by luminance so darker source pixels go to important target pixels
+        usedSources.sort((a,b)=>{
+          const la = luminance(a.color), lb = luminance(b.color);
+          return la - lb;
+        });
+        // pair top N targets with best sources
+        for(let i=0;i<N;i++){
+          const s = usedSources[i % usedSources.length];
+          const t = targets[i];
+          const particle = {
+            sx: s.x, sy: s.y,
+            x: s.x, y: s.y,
+            tx: t.x, ty: t.y,
+            color: s.color || t.color || [0,0,0,255],
+            progress: 0,
+            speed: 0.01 + Math.random()*0.04,
+            radius: 1.5 + Math.random()*2
+          };
+          particles.push(particle);
+        }
+      }
+
+      function generateFallbackSources(n){
+        const arr = [];
+        for(let i=0;i<n;i++){
+          arr.push({x: Math.random()*W, y: Math.random()*H, color: [Math.random()*255,Math.random()*255,Math.random()*255,255]});
+        }
+        return arr;
+      }
+
+      function luminance(c){
+        if(!c) return 255;
+        return 0.299*c[0] + 0.587*c[1] + 0.114*c[2];
+      }
+
+      // ---- animation ----
+      function startAnimation(){
+        if(animationId) cancelAnimationFrame(animationId);
+        function tick(){
+          ctx.clearRect(0,0,W,H);
+          // optionally draw faint target to guide (comment out to hide)
+          // drawTargetFaint();
+          let done = true;
+          for(const p of particles){
+            p.progress += p.speed;
+            if(p.progress < 1) done = false;
+            const ease = easeOutCubic(Math.min(1, p.progress));
+            p.x = p.sx + (p.tx - p.sx) * ease;
+            p.y = p.sy + (p.ty - p.sy) * ease;
+            ctx.fillStyle = `rgba(${Math.floor(p.color[0])},${Math.floor(p.color[1])},${Math.floor(p.color[2])},${(p.color[3]||255)/255})`;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.radius, 0, Math.PI*2);
+            ctx.fill();
+          }
+          animationId = requestAnimationFrame(tick);
+          if(done){
+            // slow final twinkle then stop
+            cancelAnimationFrame(animationId);
+            animationId = null;
+          }
+        }
+        animationId = requestAnimationFrame(tick);
+      }
+
+      function stopAnimation(){
+        if(animationId) cancelAnimationFrame(animationId);
+        animationId = null;
+      }
+
+      function easeOutCubic(t){ return 1 - Math.pow(1-t,3); }
+
+      function drawTargetFaint(){
+        // draw the target faintly for reference
+        if(!targetImg.complete || !targetImg.naturalWidth) return;
+        ctx.save();
+        ctx.globalAlpha = 0.2;
+        const sw = targetImg.naturalWidth, sh = targetImg.naturalHeight;
+        const scale = Math.max(W/sw, H/sh);
+        const dw = sw*scale, dh = sh*scale;
+        const dx = (W-dw)/2, dy = (H-dh)/2;
+        ctx.drawImage(targetImg, 0,0,sw,sh, dx,dy,dw,dh);
+        ctx.restore();
+      }
+
+      // initialize a faint guide target if present
+      targetImg.addEventListener('load', ()=> {
+        // redraw faint guide if not drawing/animating
+        if(!isDrawMode && !animationId){
+          ctx.clearRect(0,0,W,H);
+          drawTargetFaint();
+        }
+      });
+
+      // on load, show a faint target if obama.jpg exists
+      if(targetImg.complete && targetImg.naturalWidth){
+        drawTargetFaint();
+      }
+
+      // --- utility: flood fill implementation ---
+      function floodFill(sx, sy, fillColor){
+        // returns array of changed {x,y}
+        const img = ctx.getImageData(0,0,W,H);
+        const data = img.data;
+        const idx = (y,x)=> (y*W + x)*4;
+        if(sx < 0 || sy < 0 || sx >= W || sy >= H) return [];
+        const startI = (sy*W + sx)*4;
+        const target = [data[startI], data[startI+1], data[startI+2], data[startI+3]];
+        // if same color, nothing to do
+        if(colorsEqual(target, fillColor)) return [];
+        const stack = [[sx,sy]];
+        const changed = [];
+        while(stack.length){
+          const [x,y] = stack.pop();
+          if(x < 0 || y < 0 || x >= W || y >= H) continue;
+          const i = (y*W + x)*4;
+          if(colorsEqual([data[i],data[i+1],data[i+2],data[i+3]], target)){
+            // set to fill
+            data[i] = fillColor[0];
+            data[i+1] = fillColor[1];
+            data[i+2] = fillColor[2];
+            data[i+3] = fillColor[3];
+            changed.push({x,y});
+            stack.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]);
+          }
+        }
+        ctx.putImageData(img,0,0);
+        return changed;
+      }
+
+      function colorsEqual(a,b){
+        return a[0]===b[0] && a[1]===b[1] && a[2]===b[2] && (a[3]||255)===(b[3]||255);
+      }
+
+      function hexToRgba(hex){
+        // hex like "#rrggbb"
+        const h = hex.replace('#','');
+        const r = parseInt(h.substring(0,2),16);
+        const g = parseInt(h.substring(2,4),16);
+        const b = parseInt(h.substring(4,6),16);
+        return [r,g,b,255];
+      }
+
+    })();
+    </script>
+</body>
+</html>
